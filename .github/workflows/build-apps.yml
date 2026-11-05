@@ -1,0 +1,78 @@
+# Builds every Hyper Compute Horizon marketplace app as a ready-to-run program
+# (no Python needed) for Windows, macOS and Linux, using the live app code from
+# the published site, and publishes them to the public "apps-latest" release.
+name: Build app executables
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 3 * * *'
+permissions:
+  contents: write
+concurrency:
+  group: build-apps
+  cancel-in-progress: true
+env:
+  SITE: https://hyper-compute-horizon.lovable.app
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - { os: windows-latest, label: windows, ext: '.exe' }
+          - { os: macos-latest,   label: macos,   ext: '' }
+          - { os: ubuntu-latest,  label: linux,   ext: '' }
+        shard: [0, 1, 2]
+    runs-on: ${{ matrix.target.os }}
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install --upgrade pip numpy scipy pyinstaller
+      - name: Fetch live app code
+        shell: bash
+        run: |
+          mkdir -p apps
+          curl -fsSL "$SITE/apps/manifest.json" -o apps/manifest.json
+          python -c "import json;print('\n'.join(sorted(json.load(open('apps/manifest.json'))['apps'])))" > apps/apps.txt
+          for s in $(tr -d '\r' < apps/apps.txt); do curl -fsSL "$SITE/apps/$s.py" -o "apps/$s.py"; done
+      - name: Build (shard ${{ matrix.shard }} of 3)
+        shell: bash
+        run: |
+          mkdir -p release; i=0; failed=""
+          for s in $(tr -d '\r' < apps/apps.txt); do
+            if [ $((i % 3)) -eq ${{ matrix.shard }} ]; then
+              out="$s-${{ matrix.target.label }}"
+              if python -m PyInstaller --noconfirm --onefile --log-level WARN \
+                   --name "$out" --distpath release --workpath "build/$s" --specpath "build/$s" \
+                   "apps/$s.py" && "release/$out${{ matrix.target.ext }}" --version; then
+                echo "OK $s"
+              else
+                echo "::error::Build failed for $s"; failed="$failed $s"
+              fi
+            fi
+            i=$((i+1))
+          done
+          [ -z "$failed" ] || { echo "Failed:$failed"; exit 1; }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: exe-${{ matrix.target.label }}-${{ matrix.shard }}
+          path: release/*
+  release:
+    needs: build
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: exe-*
+          path: release
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: apps-latest
+          name: Ready-to-run app executables
+          body: Built automatically from the live marketplace app code. No Python required.
+          make_latest: true
+          files: release/*
